@@ -121,4 +121,13 @@ CLAUDE_WRAPPER_CONFIG=~/.claude-wrapper/eu.json claude
 
 ## Серверная часть
 
-В этом MVP сервер настраиваете сами — любой HTTP-прокси на `127.0.0.1:<remotePort>`, доступ только через SSH-форвард. Скрипты установки сервера — возможно, в следующей итерации.
+Repo содержит только mac-side. На сервере должен слушать HTTP-прокси на `127.0.0.1:<remotePort>` — доступ только через SSH-форвард.
+
+Минимальный пример с `tinyproxy` на Debian/Ubuntu:
+
+```sh
+apt install -y tinyproxy
+sed -i 's/^Port .*/Port 18080/; s/^Listen .*/Listen 127.0.0.1/' /etc/tinyproxy/tinyproxy.conf
+systemctl restart tinyproxy
+```
+
