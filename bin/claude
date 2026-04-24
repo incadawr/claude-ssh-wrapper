@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# claude-ssh-wrapper: routes `claude` CLI HTTP(S) traffic through an SSH-tunneled
+# HTTP proxy on a remote server. See README.md for setup.
+set -euo pipefail
+
+CONFIG="${CLAUDE_WRAPPER_CONFIG:-$HOME/.claude-wrapper/config.json}"
+WRAPPER_DIR="$(dirname "$CONFIG")"
+CONTROL_SOCK="$WRAPPER_DIR/tunnel.sock"
+
+die() {
+  echo "claude-wrapper: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+require_cmd jq
+require_cmd ssh
+
+[[ -f "$CONFIG" ]] || die "config not found: $CONFIG (run install.sh)"
+
+REMOTE_HOST=$(jq -er '.server.host' "$CONFIG") \
+  || die "config: .server.host is required"
+REMOTE_USER=$(jq -er '.server.user' "$CONFIG") \
+  || die "config: .server.user is required"
+REMOTE_PORT=$(jq -r '.server.port // 22' "$CONFIG")
+PROXY_LOCAL_PORT=$(jq -r '.proxy.localPort // 8888' "$CONFIG")
+PROXY_REMOTE_PORT=$(jq -r '.proxy.remotePort // 18080' "$CONFIG")
+CLAUDE_BIN=$(jq -er '.claude.binary' "$CONFIG") \
+  || die "config: .claude.binary is required"
+
+[[ -x "$CLAUDE_BIN" ]] || die "claude binary not executable: $CLAUDE_BIN"
+
+# ControlMaster socket path must be short enough for macOS AF_UNIX limit (~104).
+# $HOME/.claude-wrapper/tunnel.sock fits comfortably for typical user paths.
+mkdir -p "$WRAPPER_DIR"
+
+if ! ssh -S "$CONTROL_SOCK" -O check "$REMOTE_USER@$REMOTE_HOST" >/dev/null 2>&1; then
+  # Stale socket from a dead master leaves a file behind; remove before reopening.
+  [[ -S "$CONTROL_SOCK" ]] && rm -f "$CONTROL_SOCK"
+
+  ssh -M -S "$CONTROL_SOCK" -fN \
+      -p "$REMOTE_PORT" \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -L "127.0.0.1:$PROXY_LOCAL_PORT:127.0.0.1:$PROXY_REMOTE_PORT" \
+      "$REMOTE_USER@$REMOTE_HOST" \
+    || die "failed to open SSH tunnel to $REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT"
+fi
+
+export HTTPS_PROXY="http://127.0.0.1:$PROXY_LOCAL_PORT"
+export HTTP_PROXY="$HTTPS_PROXY"
+export NO_PROXY="localhost,127.0.0.1,::1"
+# Some tools read lowercase variants; export both for compatibility.
+export https_proxy="$HTTPS_PROXY"
+export http_proxy="$HTTP_PROXY"
+export no_proxy="$NO_PROXY"
+
+# Show on stderr so it's visible but doesn't contaminate stdout pipelines.
+# Suppress with CLAUDE_WRAPPER_QUIET=1 when running claude in scripts.
+if [[ -z "${CLAUDE_WRAPPER_QUIET:-}" ]]; then
+  echo "claude-wrapper: via $REMOTE_USER@$REMOTE_HOST (127.0.0.1:$PROXY_LOCAL_PORT → :$PROXY_REMOTE_PORT)" >&2
+fi
+
+exec "$CLAUDE_BIN" "$@"

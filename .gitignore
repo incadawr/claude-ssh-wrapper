@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# editors / IDE / agents
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+
+# local runtime state (shouldn't normally end up in the repo, but guard anyway)
+tunnel.sock
+tunnel.sock.*
+*.log
