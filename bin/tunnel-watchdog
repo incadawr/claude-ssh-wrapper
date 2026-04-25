@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# tunnel-watchdog: periodically probes the SSH+proxy chain and appends a
+# one-line status to ~/.claude-wrapper/tunnel.log.
+#
+# Spawned (detached) by bin/claude on first invocation per session. Single
+# instance enforced via PID file with O_EXCL semantics. Exits cleanly when
+# the SSH master has been gone for FAIL_LIMIT consecutive checks — the next
+# `claude` invocation will respawn it alongside a fresh master.
+#
+# This script is internal: not meant to be invoked directly by users.
+set -euo pipefail
+
+CONFIG="${CLAUDE_WRAPPER_CONFIG:-$HOME/.claude-wrapper/config.json}"
+WRAPPER_DIR="$(dirname "$CONFIG")"
+CONTROL_SOCK="$WRAPPER_DIR/tunnel.sock"
+PID_FILE="$WRAPPER_DIR/watchdog.pid"
+LOG_FILE="$WRAPPER_DIR/tunnel.log"
+
+INTERVAL="${CLAUDE_WRAPPER_WATCHDOG_INTERVAL:-30}"
+FAIL_LIMIT="${CLAUDE_WRAPPER_WATCHDOG_FAIL_LIMIT:-3}"
+PROBE_URL="${CLAUDE_WRAPPER_WATCHDOG_URL:-https://api.anthropic.com/}"
+PROBE_TIMEOUT="${CLAUDE_WRAPPER_WATCHDOG_TIMEOUT:-5}"
+LOG_MAX_LINES="${CLAUDE_WRAPPER_WATCHDOG_LOG_MAX:-5000}"
+
+[[ -f "$CONFIG" ]] || exit 0
+command -v jq  >/dev/null 2>&1 || exit 0
+command -v ssh >/dev/null 2>&1 || exit 0
+
+REMOTE_HOST=$(jq -er '.server.host' "$CONFIG" 2>/dev/null) || exit 0
+REMOTE_USER=$(jq -er '.server.user' "$CONFIG" 2>/dev/null) || exit 0
+PROXY_LOCAL_PORT=$(jq -r '.proxy.localPort // 8888' "$CONFIG")
+PROXY_URL="http://127.0.0.1:$PROXY_LOCAL_PORT"
+
+mkdir -p "$WRAPPER_DIR"
+touch "$LOG_FILE"
+
+# Atomic single-instance lock. `set -C` (noclobber) makes the redirect fail
+# if the file already exists, which is racefree against another watchdog
+# starting at the same moment.
+if ! ( set -C; printf '%s\n' "$$" > "$PID_FILE" ) 2>/dev/null; then
+  exit 0
+fi
+
+log() {
+  local level="$1"; shift
+  printf '%s %-5s %s\n' "$(date +%FT%T%z)" "$level" "$*" >> "$LOG_FILE"
+}
+
+# Cap log size to avoid unbounded growth over weeks of uptime.
+rotate_log_if_big() {
+  local lines
+  lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+  if [[ "$lines" -gt "$LOG_MAX_LINES" ]]; then
+    local keep
+    keep=$((LOG_MAX_LINES / 2))
+    local tmp="${LOG_FILE}.tmp.$$"
+    tail -n "$keep" "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
+  fi
+}
+
+cleanup() {
+  rm -f "$PID_FILE"
+}
+trap cleanup EXIT
+
+# Signals during a `sleep N` foreground call are queued by bash until the
+# child exits — meaning a 30s sleep can delay shutdown by 30s. Run sleep in
+# the background and `wait` on it so signals interrupt promptly.
+SLEEP_PID=""
+on_signal() {
+  log STOP "received signal"
+  if [[ -n "$SLEEP_PID" ]]; then
+    kill "$SLEEP_PID" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap on_signal INT TERM
+
+interruptible_sleep() {
+  sleep "$1" &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID" 2>/dev/null || true
+  SLEEP_PID=""
+}
+
+log START "watchdog pid=$$ proxy=$PROXY_URL interval=${INTERVAL}s timeout=${PROBE_TIMEOUT}s"
+
+consecutive_master_fail=0
+rotate_counter=0
+
+while :; do
+  if [[ ! -S "$CONTROL_SOCK" ]] \
+     || ! ssh -S "$CONTROL_SOCK" -O check "$REMOTE_USER@$REMOTE_HOST" >/dev/null 2>&1; then
+    consecutive_master_fail=$((consecutive_master_fail + 1))
+    log FAIL "ssh master down (consecutive=$consecutive_master_fail)"
+    if [[ "$consecutive_master_fail" -ge "$FAIL_LIMIT" ]]; then
+      log STOP "master gone for $consecutive_master_fail cycles, exiting"
+      exit 0
+    fi
+  else
+    consecutive_master_fail=0
+    out=$(curl -sS --max-time "$PROBE_TIMEOUT" -x "$PROXY_URL" -o /dev/null \
+                -w '%{http_code} %{time_total}' "$PROBE_URL" 2>/dev/null \
+          || echo "000 0")
+    read -r code time <<< "$out"
+    if [[ "$code" == "000" ]]; then
+      log FAIL "proxy probe: no HTTP response (master alive, proxy or upstream broken)"
+    else
+      log OK "http=$code time=${time}s"
+    fi
+  fi
+
+  rotate_counter=$((rotate_counter + 1))
+  if [[ "$rotate_counter" -ge 100 ]]; then
+    rotate_log_if_big
+    rotate_counter=0
+  fi
+
+  interruptible_sleep "$INTERVAL"
+done

@@ -4,11 +4,15 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_SRC="$REPO_DIR/bin/claude"
+DOCTOR_SRC="$REPO_DIR/bin/claude-doctor"
+WATCHDOG_SRC="$REPO_DIR/bin/tunnel-watchdog"
 
 BIN_DIR="$HOME/bin"
 BIN_DST="$BIN_DIR/claude"
+DOCTOR_DST="$BIN_DIR/claude-doctor"
 WRAPPER_DIR="$HOME/.claude-wrapper"
 CONFIG="$WRAPPER_DIR/config.json"
+WATCHDOG_DST="$WRAPPER_DIR/tunnel-watchdog"
 
 err() { echo "install: $*" >&2; }
 info() { echo "install: $*"; }
@@ -75,6 +79,14 @@ mkdir -p "$WRAPPER_DIR"
 # --- 4. install wrapper ----------------------------------------------------
 install -m 0755 "$BIN_SRC" "$BIN_DST"
 info "installed wrapper to $BIN_DST"
+
+install -m 0755 "$DOCTOR_SRC" "$DOCTOR_DST"
+info "installed claude-doctor to $DOCTOR_DST"
+
+# Watchdog lives next to the config because it's an internal helper, not
+# something users invoke directly. Spawned on demand by bin/claude.
+install -m 0755 "$WATCHDOG_SRC" "$WATCHDOG_DST"
+info "installed tunnel-watchdog to $WATCHDOG_DST"
 
 # --- 5. create config if missing -------------------------------------------
 if [[ ! -f "$CONFIG" ]]; then
@@ -214,3 +226,7 @@ info "  1. edit $CONFIG (set server.host and server.user)"
 info "  2. make sure SSH key auth to that host works: ssh <user>@<host>"
 info "  3. ensure an HTTP proxy is listening on the server at 127.0.0.1:<remotePort>"
 info "  4. run: claude"
+info ""
+info "diagnostics:"
+info "  claude-doctor                          # one-shot health check"
+info "  tail -f $WRAPPER_DIR/tunnel.log   # live tunnel status (watchdog auto-starts)"

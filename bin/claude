@@ -6,6 +6,8 @@ set -euo pipefail
 CONFIG="${CLAUDE_WRAPPER_CONFIG:-$HOME/.claude-wrapper/config.json}"
 WRAPPER_DIR="$(dirname "$CONFIG")"
 CONTROL_SOCK="$WRAPPER_DIR/tunnel.sock"
+WATCHDOG_BIN="$WRAPPER_DIR/tunnel-watchdog"
+WATCHDOG_PID_FILE="$WRAPPER_DIR/watchdog.pid"
 
 die() {
   echo "claude-wrapper: $*" >&2
@@ -58,6 +60,38 @@ export NO_PROXY="localhost,127.0.0.1,::1"
 export https_proxy="$HTTPS_PROXY"
 export http_proxy="$HTTP_PROXY"
 export no_proxy="$NO_PROXY"
+
+# Pre-flight: confirm the proxy actually carries traffic before exec'ing
+# claude. Without this a dead remote proxy (or a half-broken tunnel where
+# `ssh -O check` says OK but the forward is wedged) bubbles up inside claude
+# as "API Error: ConnectionRefused" — looks like an Anthropic outage. Any
+# HTTP status (incl. 4xx) proves the chain mac→ssh→proxy→api works. Set
+# CLAUDE_WRAPPER_NO_PREFLIGHT=1 to skip when latency matters more than
+# diagnostics.
+if [[ -z "${CLAUDE_WRAPPER_NO_PREFLIGHT:-}" ]]; then
+  preflight=$(curl -sS --max-time 5 -x "$HTTPS_PROXY" -o /dev/null \
+                   -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null \
+              || echo "000")
+  if [[ "$preflight" == "000" ]]; then
+    die "tunnel/proxy unreachable via $HTTPS_PROXY. Run: claude-doctor"
+  fi
+fi
+
+# Spawn the watchdog (detached) if no live instance exists. Stale PID files
+# from crashed watchdogs are cleared so the next start can take the lock.
+if [[ -x "$WATCHDOG_BIN" ]]; then
+  watchdog_alive=0
+  if [[ -f "$WATCHDOG_PID_FILE" ]] \
+     && kill -0 "$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+    watchdog_alive=1
+  else
+    rm -f "$WATCHDOG_PID_FILE"
+  fi
+  if [[ "$watchdog_alive" -eq 0 ]]; then
+    nohup "$WATCHDOG_BIN" >/dev/null 2>&1 </dev/null &
+    disown
+  fi
+fi
 
 # Show on stderr so it's visible but doesn't contaminate stdout pipelines.
 # Suppress with CLAUDE_WRAPPER_QUIET=1 when running claude in scripts.

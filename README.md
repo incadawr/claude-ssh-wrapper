@@ -88,14 +88,96 @@ ssh -S ~/.claude-wrapper/tunnel.sock -O exit dummy
 
 ## Диагностика
 
-Два скрипта для проверки настройки без запуска `claude`:
+Когда `claude` падает с чем-то вроде `API Error: Unable to connect to API (ConnectionRefused)` — это почти всегда означает, что упала локальная связка SSH+прокси, а не настоящий API. Чтобы это сразу было видно:
+
+### Pre-flight в самом враппере
+
+Перед `exec claude` враппер делает быстрый `curl` через прокси к `api.anthropic.com`. Если ответа нет — выходит с понятным сообщением вместо того, чтобы дать `claude` стартовать и сломаться внутри.
+
+```
+claude-wrapper: tunnel/proxy unreachable via http://127.0.0.1:8888. Run: claude-doctor
+```
+
+Отключить (если хочется минимум задержки и вы готовы видеть стандартную ошибку клода): `CLAUDE_WRAPPER_NO_PREFLIGHT=1 claude`.
+
+### `claude-doctor` — one-shot health-чек
+
+Ставится установщиком в `~/bin/claude-doctor`. Проверяет конфиг, ssh master, локальный listener, прокси-зонд через тоннель и прямой зонд (для baseline). Не открывает и не закрывает ничего — безопасно запускать когда `claude` уже работает.
+
+```sh
+claude-doctor
+```
+
+Пример вывода при упавшем туннеле:
+
+```
+ssh master
+  ✗ control socket missing: ~/.claude-wrapper/tunnel.sock
+    tunnel is not open. fix: run 'claude' once to (re)open the master
+proxy probe (api.anthropic.com via http://127.0.0.1:8888)
+  ✗ no HTTP response (curl couldn't connect through the proxy)
+direct probe (api.anthropic.com without proxy)
+  ✓ HTTP 404 in 0.17s
+
+verdict: tunnel down. mac itself reaches api.anthropic.com — fix the SSH/proxy chain.
+```
+
+### Live health-лог (`tunnel-watchdog`)
+
+Враппер при первом запуске поднимает фоновый watchdog (`~/.claude-wrapper/tunnel-watchdog`), который раз в 30 секунд пишет одну строку в `~/.claude-wrapper/tunnel.log`:
+
+```sh
+tail -f ~/.claude-wrapper/tunnel.log
+```
+
+```
+2026-04-25T22:30:15+0300 OK    http=401 time=0.234s
+2026-04-25T22:30:45+0300 OK    http=401 time=0.219s
+2026-04-25T22:31:15+0300 FAIL  ssh master down (consecutive=1)
+2026-04-25T22:31:45+0300 FAIL  ssh master down (consecutive=2)
+2026-04-25T22:32:15+0300 STOP  master gone for 3 cycles, exiting
+```
+
+Single-instance через PID-файл — повторные запуски `claude` не плодят watchdogs. Watchdog сам гасится после трёх подряд `FAIL master down` (типичный сценарий — пользователь сделал `ssh -O exit`); при следующем `claude` стартует заново вместе с новым master. Лог обрезается до ~5000 строк автоматически.
+
+Параметры для тонкой настройки (env, читаются watchdogом при старте):
+
+| Env | Дефолт | Описание |
+|---|---|---|
+| `CLAUDE_WRAPPER_WATCHDOG_INTERVAL` | 30 | период проверки, секунды |
+| `CLAUDE_WRAPPER_WATCHDOG_TIMEOUT` | 5 | таймаут одного curl-зонда |
+| `CLAUDE_WRAPPER_WATCHDOG_FAIL_LIMIT` | 3 | сколько подряд `master down` до самовыхода |
+| `CLAUDE_WRAPPER_WATCHDOG_URL` | `https://api.anthropic.com/` | что зондируем |
+| `CLAUDE_WRAPPER_WATCHDOG_LOG_MAX` | 5000 | потолок строк в `tunnel.log` |
+
+### Меню-бар индикатор (опционально)
+
+В `extras/swiftbar/` лежит плагин для [SwiftBar](https://swiftbar.app) (или [xbar](https://xbarapp.com)). Кладёт в меню-бар иконку с цветом по последнему статусу из `tunnel.log` и dropdown с последними строками лога и быстрыми действиями (запустить `claude-doctor`, открыть `tail -f`, переоткрыть тоннель).
+
+```sh
+brew install --cask swiftbar
+ln -s "$PWD/extras/swiftbar/claude-tunnel.30s.sh" \
+      "$HOME/Library/Application Support/SwiftBar/claude-tunnel.30s.sh"
+# затем в SwiftBar: Refresh All
+```
+
+Что увидите в меню-баре:
+- 🟢 `192ms` — последний пробинг прошёл, в скобках latency через прокси
+- 🔴 `fail` — последняя строка лога FAIL (`master down` или прокси не отвечает)
+- 🟡 `stale` — лог старше 90с (watchdog, видимо, повис)
+- 🟡 `off` — watchdog не запущен (запустите `claude` любой командой)
+- ⚪ `stopped` — watchdog штатно завершился (после трёх FAIL подряд)
+
+Плагин read-only: только читает `tunnel.log` и `watchdog.pid`, ничего не открывает и не пишет. Установщик `install.sh` его НЕ ставит — это опциональная интеграция, лежит в репо отдельно.
+
+### Старые скрипты в `scripts/`
 
 ```sh
 ./scripts/bash-check.sh      # проверяет ключ/SSH/форвард/прокси (hardcoded дефолты)
 ./scripts/wrapper-check.sh   # то же, но читает реальный ~/.claude-wrapper/config.json
 ```
 
-`wrapper-check.sh` повторяет логику враппера 1:1 (тот же конфиг, тот же ControlMaster, те же env), но вместо `exec claude` делает `curl --proxy ...` и печатает egress IP — так видно, работает ли именно связка «враппер → прокси», независимо от самого клода.
+`wrapper-check.sh` повторяет логику враппера 1:1 (тот же конфиг, тот же ControlMaster, те же env), но вместо `exec claude` делает `curl --proxy ...` и печатает egress IP — так видно, работает ли именно связка «враппер → прокси». В отличие от `claude-doctor`, при необходимости сам *открывает* тоннель (и закрывает за собой, если открывал).
 
 ## Несколько профилей
 

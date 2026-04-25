@@ -16,6 +16,8 @@
 - **SSH ControlMaster.** Первый запуск поднимает master-соединение в фоне, последующие переиспользуют сокет — старт `claude` не тормозится рукопожатием SSH каждый раз.
 - **Env-переменные, не хаки.** Только `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`. Никакой магии с `DYLD_*`, `PF`, никаких network extensions.
 - **Никакой авто-остановки туннеля.** Master живёт до явного `ssh -O exit` или перезагрузки. Reference-counting (гасить после последнего claude) — сознательно вне MVP.
+- **Pre-flight через прокси перед `exec claude`.** Без этого мёртвый туннель/прокси выглядит изнутри `claude` как `API Error: ConnectionRefused` — неотличимо от падения апи. Pre-flight даёт чёткое сообщение с указанием на `claude-doctor`. Отключается `CLAUDE_WRAPPER_NO_PREFLIGHT=1`.
+- **Watchdog.** Отдельный детач-процесс `~/.claude-wrapper/tunnel-watchdog`, спавнится враппером, single-instance через PID-файл, пишет одну строку статуса в `tunnel.log` каждые 30с. Существует ради `tail -f` — пользователю нужен независимый источник правды о том, жив ли туннель. Сам себя гасит, когда master отсутствует FAIL_LIMIT циклов подряд (обычно после `ssh -O exit`).
 
 ## Структура репозитория
 
@@ -24,13 +26,27 @@ claude-ssh-wrapper/
 ├── CLAUDE.md               # этот файл
 ├── README.md               # пользовательский install/usage
 ├── bin/
-│   └── claude              # сам враппер (bash)
+│   ├── claude              # сам враппер (bash)
+│   ├── claude-doctor       # one-shot диагностика — ставится в ~/bin
+│   └── tunnel-watchdog     # фоновый health-логгер — ставится в ~/.claude-wrapper
 ├── install.sh              # установщик (интерактивный)
 ├── uninstall.sh            # деинсталлятор (--purge стирает и конфиг)
-└── scripts/
-    ├── bash-check.sh       # end-to-end проверка ключ/SSH/прокси с hardcoded дефолтами
-    └── wrapper-check.sh    # то же, но через реальный ~/.claude-wrapper/config.json
+├── scripts/
+│   ├── bash-check.sh       # end-to-end проверка ключ/SSH/прокси с hardcoded дефолтами
+│   └── wrapper-check.sh    # то же, но через реальный ~/.claude-wrapper/config.json
+└── extras/                 # опциональные интеграции, install.sh их не трогает
+    └── swiftbar/
+        └── claude-tunnel.30s.sh  # SwiftBar/xbar-плагин: индикатор в меню-баре
 ```
+
+В рантайме файлы пользователя:
+- `~/bin/claude` — враппер (на PATH)
+- `~/bin/claude-doctor` — диагностика (на PATH)
+- `~/.claude-wrapper/config.json` — единственный конфиг
+- `~/.claude-wrapper/tunnel.sock` — SSH ControlMaster
+- `~/.claude-wrapper/tunnel-watchdog` — внутренний хелпер (не на PATH)
+- `~/.claude-wrapper/watchdog.pid` — PID-файл watchdog (single-instance lock)
+- `~/.claude-wrapper/tunnel.log` — health-лог watchdog (rotate ~5000 строк)
 
 ## Технологический стек
 

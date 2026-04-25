@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# claude-doctor: read-only diagnostic for the claude-ssh-wrapper.
+#
+# Distinguishes "tunnel is down" from "API is down" — the two failure modes
+# both surface inside `claude` as "ConnectionRefused"/"network error" and are
+# otherwise indistinguishable. Does NOT open/close the SSH master; safe to run
+# while `claude` is in flight.
+set -euo pipefail
+
+CONFIG="${CLAUDE_WRAPPER_CONFIG:-$HOME/.claude-wrapper/config.json}"
+WRAPPER_DIR="$(dirname "$CONFIG")"
+CONTROL_SOCK="$WRAPPER_DIR/tunnel.sock"
+LOG_FILE="$WRAPPER_DIR/tunnel.log"
+PID_FILE="$WRAPPER_DIR/watchdog.pid"
+
+BOLD=$(tput bold 2>/dev/null || true)
+DIM=$(tput dim 2>/dev/null || true)
+GREEN=$(tput setaf 2 2>/dev/null || true)
+RED=$(tput setaf 1 2>/dev/null || true)
+YELLOW=$(tput setaf 3 2>/dev/null || true)
+RESET=$(tput sgr0 2>/dev/null || true)
+
+pass() { printf '  %s✓%s %s\n'  "$GREEN" "$RESET" "$*"; }
+fail() { printf '  %s✗%s %s\n'  "$RED"   "$RESET" "$*"; FAILED=1; }
+warn() { printf '  %s!%s %s\n'  "$YELLOW" "$RESET" "$*"; }
+head() { printf '\n%s%s%s\n'    "$BOLD"   "$*"      "$RESET"; }
+note() { printf '    %s%s%s\n'  "$DIM"    "$*"      "$RESET"; }
+
+FAILED=0
+
+# --- 1. config -------------------------------------------------------------
+head "config"
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq missing (brew install jq)"
+  exit 1
+fi
+if [[ ! -f "$CONFIG" ]]; then
+  fail "$CONFIG not found (run install.sh)"
+  exit 1
+fi
+pass "$CONFIG"
+
+REMOTE_HOST=$(jq -er '.server.host' "$CONFIG") \
+  || { fail ".server.host missing"; exit 1; }
+REMOTE_USER=$(jq -er '.server.user' "$CONFIG") \
+  || { fail ".server.user missing"; exit 1; }
+REMOTE_PORT=$(jq -r '.server.port // 22' "$CONFIG")
+PROXY_LOCAL_PORT=$(jq -r '.proxy.localPort // 8888' "$CONFIG")
+PROXY_REMOTE_PORT=$(jq -r '.proxy.remotePort // 18080' "$CONFIG")
+CLAUDE_BIN=$(jq -r '.claude.binary // empty' "$CONFIG")
+PROXY_URL="http://127.0.0.1:$PROXY_LOCAL_PORT"
+
+note "server     : $REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT"
+note "tunnel     : 127.0.0.1:$PROXY_LOCAL_PORT → :$PROXY_REMOTE_PORT"
+note "claude bin : ${CLAUDE_BIN:-<unset>}"
+
+if [[ -n "$CLAUDE_BIN" && ! -x "$CLAUDE_BIN" ]]; then
+  fail "claude binary not executable: $CLAUDE_BIN"
+fi
+
+# --- 2. ssh master ---------------------------------------------------------
+head "ssh master"
+if [[ ! -S "$CONTROL_SOCK" ]]; then
+  fail "control socket missing: $CONTROL_SOCK"
+  note "tunnel is not open. fix: run 'claude' once to (re)open the master"
+  MASTER_OK=0
+elif ssh -S "$CONTROL_SOCK" -O check "$REMOTE_USER@$REMOTE_HOST" >/dev/null 2>&1; then
+  pass "alive ($CONTROL_SOCK)"
+  MASTER_OK=1
+else
+  fail "control socket exists but ssh -O check failed"
+  note "stale master. fix: rm $CONTROL_SOCK && run 'claude' once"
+  MASTER_OK=0
+fi
+
+# --- 3. local listener -----------------------------------------------------
+head "local listener"
+if lsof -nP -iTCP:"$PROXY_LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  pass "127.0.0.1:$PROXY_LOCAL_PORT is listening"
+else
+  fail "nothing listening on 127.0.0.1:$PROXY_LOCAL_PORT"
+  if [[ "$MASTER_OK" -eq 1 ]]; then
+    note "master is alive but port-forward isn't — try: ssh -S $CONTROL_SOCK -O exit dummy && claude"
+  fi
+fi
+
+# --- 4. proxy probe --------------------------------------------------------
+head "proxy probe (api.anthropic.com via $PROXY_URL)"
+proxy_out=$(curl -sS --max-time 5 -x "$PROXY_URL" -o /dev/null \
+                 -w '%{http_code} %{time_total}' \
+                 https://api.anthropic.com/ 2>/dev/null \
+            || echo "000 0")
+read -r proxy_code proxy_time <<< "$proxy_out"
+if [[ "$proxy_code" == "000" ]]; then
+  fail "no HTTP response (curl couldn't connect through the proxy)"
+  note "either tunnel is dead or the remote HTTP proxy isn't running"
+else
+  # Any HTTP status proves the chain (mac → SSH → tinyproxy → CONNECT → api)
+  # carries traffic. 401/403 are the expected unauthenticated responses.
+  pass "HTTP $proxy_code in ${proxy_time}s"
+fi
+
+# --- 5. direct probe (baseline) -------------------------------------------
+head "direct probe (api.anthropic.com without proxy)"
+direct_out=$(curl -sS --max-time 5 --noproxy '*' -o /dev/null \
+                  -w '%{http_code} %{time_total}' \
+                  https://api.anthropic.com/ 2>/dev/null \
+             || echo "000 0")
+read -r direct_code direct_time <<< "$direct_out"
+if [[ "$direct_code" == "000" ]]; then
+  warn "no HTTP response directly either (your mac has no internet?)"
+else
+  pass "HTTP $direct_code in ${direct_time}s"
+fi
+
+# --- 6. watchdog -----------------------------------------------------------
+head "watchdog"
+if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+  pass "running (pid=$(cat "$PID_FILE")) — log: $LOG_FILE"
+  if [[ -f "$LOG_FILE" ]]; then
+    note "last 3 lines:"
+    tail -n 3 "$LOG_FILE" | sed "s|^|    $DIM|; s|$|$RESET|"
+  fi
+else
+  warn "not running (will start on next 'claude' invocation)"
+fi
+
+# --- verdict ---------------------------------------------------------------
+echo
+if [[ "$FAILED" -eq 0 ]]; then
+  printf '%s%sverdict:%s tunnel ok. claude API errors are upstream of the proxy.\n' \
+         "$BOLD" "$GREEN" "$RESET"
+  exit 0
+fi
+if [[ "$direct_code" != "000" && "$direct_code" != "0" ]]; then
+  printf '%s%sverdict:%s tunnel down. mac itself reaches api.anthropic.com — fix the SSH/proxy chain.\n' \
+         "$BOLD" "$RED" "$RESET"
+else
+  printf '%s%sverdict:%s tunnel down AND mac has no direct internet — check your network first.\n' \
+         "$BOLD" "$RED" "$RESET"
+fi
+exit 1
