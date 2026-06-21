@@ -3,7 +3,8 @@
 # master connection. Config is preserved unless --purge is passed.
 set -euo pipefail
 
-BIN_DST="$HOME/bin/claude"
+CLAUDE_DST="$HOME/bin/claude"
+CODEX_DST="$HOME/bin/codex"
 DOCTOR_DST="$HOME/bin/claude-doctor"
 WRAPPER_DIR="$HOME/.claude-wrapper"
 CONFIG="$WRAPPER_DIR/config.json"
@@ -61,9 +62,14 @@ if [[ -S "$CONTROL_SOCK" ]]; then
   rm -f "$CONTROL_SOCK"
 fi
 
-if [[ -e "$BIN_DST" || -L "$BIN_DST" ]]; then
-  rm -f "$BIN_DST"
-  info "removed $BIN_DST"
+if [[ -e "$CLAUDE_DST" || -L "$CLAUDE_DST" ]]; then
+  rm -f "$CLAUDE_DST"
+  info "removed $CLAUDE_DST"
+fi
+
+if [[ -e "$CODEX_DST" || -L "$CODEX_DST" ]]; then
+  rm -f "$CODEX_DST"
+  info "removed $CODEX_DST"
 fi
 
 if [[ -e "$DOCTOR_DST" || -L "$DOCTOR_DST" ]]; then

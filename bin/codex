@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# claude-ssh-wrapper: routes `codex` CLI HTTP(S) traffic through the same
+# SSH-tunneled HTTP proxy that wraps `claude`. Shares config, tunnel, and
+# watchdog with bin/claude. See README.md.
+set -euo pipefail
+
+CONFIG="${CLAUDE_WRAPPER_CONFIG:-$HOME/.claude-wrapper/config.json}"
+WRAPPER_DIR="$(dirname "$CONFIG")"
+CONTROL_SOCK="$WRAPPER_DIR/tunnel.sock"
+WATCHDOG_BIN="$WRAPPER_DIR/tunnel-watchdog"
+WATCHDOG_PID_FILE="$WRAPPER_DIR/watchdog.pid"
+
+die() {
+  echo "codex-wrapper: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+require_cmd jq
+require_cmd ssh
+
+[[ -f "$CONFIG" ]] || die "config not found: $CONFIG (run install.sh)"
+
+REMOTE_HOST=$(jq -er '.server.host' "$CONFIG") \
+  || die "config: .server.host is required"
+REMOTE_USER=$(jq -er '.server.user' "$CONFIG") \
+  || die "config: .server.user is required"
+REMOTE_PORT=$(jq -r '.server.port // 22' "$CONFIG")
+PROXY_LOCAL_PORT=$(jq -r '.proxy.localPort // 8888' "$CONFIG")
+PROXY_REMOTE_PORT=$(jq -r '.proxy.remotePort // 18080' "$CONFIG")
+CODEX_BIN=$(jq -er '.codex.binary' "$CONFIG") \
+  || die "config: .codex.binary is required (re-run install.sh to add)"
+
+[[ -x "$CODEX_BIN" ]] || die "codex binary not executable: $CODEX_BIN"
+
+mkdir -p "$WRAPPER_DIR"
+
+if ! ssh -S "$CONTROL_SOCK" -O check "$REMOTE_USER@$REMOTE_HOST" >/dev/null 2>&1; then
+  [[ -S "$CONTROL_SOCK" ]] && rm -f "$CONTROL_SOCK"
+
+  ssh -M -S "$CONTROL_SOCK" -fN \
+      -p "$REMOTE_PORT" \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -L "127.0.0.1:$PROXY_LOCAL_PORT:127.0.0.1:$PROXY_REMOTE_PORT" \
+      "$REMOTE_USER@$REMOTE_HOST" \
+    || die "failed to open SSH tunnel to $REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT"
+fi
+
+export HTTPS_PROXY="http://127.0.0.1:$PROXY_LOCAL_PORT"
+export HTTP_PROXY="$HTTPS_PROXY"
+export NO_PROXY="localhost,127.0.0.1,::1"
+export https_proxy="$HTTPS_PROXY"
+export http_proxy="$HTTP_PROXY"
+export no_proxy="$NO_PROXY"
+
+if [[ -x "$WATCHDOG_BIN" ]]; then
+  watchdog_alive=0
+  if [[ -f "$WATCHDOG_PID_FILE" ]] \
+     && kill -0 "$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+    watchdog_alive=1
+  else
+    rm -f "$WATCHDOG_PID_FILE"
+  fi
+  if [[ "$watchdog_alive" -eq 0 ]]; then
+    nohup "$WATCHDOG_BIN" >/dev/null 2>&1 </dev/null &
+    disown
+  fi
+fi
+
+if [[ -z "${CODEX_WRAPPER_QUIET:-}" ]]; then
+  echo "codex-wrapper: via $REMOTE_USER@$REMOTE_HOST (127.0.0.1:$PROXY_LOCAL_PORT → :$PROXY_REMOTE_PORT)" >&2
+fi
+
+exec "$CODEX_BIN" "$@"
